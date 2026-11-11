@@ -1,11 +1,12 @@
-import {fields, key, list, distinct, label, select, instant, demand, found, checksum, encode} from './primitives.js';
-import {assertGrant, requireBudget} from './policy.js';
+import {fields, key, label, list, distinct, select, instant, demand, found, checksum} from './primitives.js';
+import {assertGrant, requireBudget, requireAggregateBudget} from './policy.js';
 import {requireSteward} from './registry.js';
 import {buildDisclosure} from './disclosure.js';
+import {aggregateSpec, buildAggregate} from './aggregate.js';
 
 export async function proposeRequest(vault, index, input, actor, at) {
-  fields(input, ['id', 'grant', 'reference', 'recipient', 'purpose', 'columns', 'filters', 'format', 'expiresAt'],
-    ['id', 'grant', 'reference', 'recipient', 'purpose', 'columns', 'expiresAt']);
+  fields(input, ['id', 'grant', 'reference', 'recipient', 'purpose', 'columns', 'filters', 'format', 'expiresAt', 'mode', 'aggregate'],
+    ['id', 'grant', 'reference', 'recipient', 'purpose', 'expiresAt']);
   const id = key(input.id);
   const fingerprint = checksum(input);
   const existing = index.requests[id];
@@ -16,26 +17,36 @@ export async function proposeRequest(vault, index, input, actor, at) {
   const grant = found(index.grants, key(input.grant), 'Grant');
   const recipient = found(index.organizations, key(input.recipient), 'Recipient');
   requireSteward(index, recipient.id, actor);
-  const columns = distinct(list(input.columns, 'columns', 200).map(value => key(value)), 'columns');
-  const request = {
+  const mode = select(input.mode ?? 'row', ['row', 'aggregate'], 'mode');
+  const expiresAt = instant(input.expiresAt, 'expiresAt');
+  const base = {
     id,
     grant: grant.id,
     reference: input.reference,
     recipient: recipient.id,
     purpose: key(input.purpose),
-    columns,
     filters: input.filters ?? [],
     format: select(input.format ?? 'jsonl', ['jsonl', 'json', 'csv'], 'format'),
-    expiresAt: instant(input.expiresAt, 'expiresAt'),
+    expiresAt,
     requestedBy: key(actor),
     requestedAt: at,
     inputHash: fingerprint,
     status: 'pending',
     approvals: [],
     policyHash: grant.policyHash,
+    mode,
   };
-  demand(request.expiresAt > at && request.expiresAt <= grant.expiresAt, 'request_expiry', 'Request expiry must fit the grant');
-  const version = assertGrant(index, grant, request, at);
+  demand(base.expiresAt > at && base.expiresAt <= grant.expiresAt, 'request_expiry', 'Request expiry must fit the grant');
+  if (mode === 'aggregate') {
+    return proposeAggregate(vault, index, base, input, grant, at);
+  }
+  return proposeRow(vault, index, base, input, grant);
+}
+
+async function proposeRow(vault, index, request, input, grant) {
+  const columns = distinct(list(input.columns, 'columns', 200).map(value => key(value)), 'columns');
+  Object.assign(request, {columns, aggregate: null});
+  const version = assertGrant(index, grant, request, request.requestedAt);
   const rows = await vault.getRows(version.object);
   const secret = await vault.secret();
   const disclosure = buildDisclosure(rows, version, grant, request, secret);
@@ -49,8 +60,44 @@ export async function proposeRequest(vault, index, input, actor, at) {
     versionObject: version.object,
     schemaHash: version.schemaHash,
   });
-  index.requests[id] = request;
-  return {result: {request, replay: false}, audit: {request: id, reservedRows: request.outputRows, grant: grant.id}};
+  index.requests[request.id] = request;
+  return {result: {request, replay: false}, audit: {request: request.id, reservedRows: request.outputRows, grant: grant.id}};
+}
+
+async function proposeAggregate(vault, index, request, input, grant, at) {
+  demand(input.columns === undefined, 'aggregate_columns', 'Aggregate requests select dimensions and measures, not row columns');
+  const version = usableVersionForPreview(index, request);
+  const aggregate = aggregateSpec(input.aggregate, version, grant);
+  Object.assign(request, {columns: null, aggregate});
+  assertGrant(index, grant, request, at);
+  const rows = await vault.getRows(version.object);
+  const secret = await vault.secret();
+  const result = buildAggregate(rows, version, grant, request, secret);
+  demand(result.report.publishedCells > 0, 'empty_release', 'Every aggregate cell is suppressed; nothing can be published');
+  requireAggregateBudget(index, grant.id);
+  Object.assign(request, {
+    outputRows: 0,
+    outputHash: result.fingerprint,
+    disclosure: result.report,
+    filters: result.filters,
+    versionObject: version.object,
+    schemaHash: version.schemaHash,
+    aggregateHash: checksum(aggregate),
+  });
+  index.requests[request.id] = request;
+  return {result: {request, replay: false},
+    audit: {request: request.id, grant: grant.id, mode: 'aggregate', cells: result.report.cells,
+      suppressed: result.report.suppressedCells}};
+}
+
+function usableVersionForPreview(index, request) {
+  const version = found(index.versions, request.reference, 'Version');
+  demand(version.status === 'active', 'version_unavailable', 'Version is not active', {reference: version.reference});
+  for (const dependency of version.dependencies) {
+    const parent = found(index.versions, dependency, 'Version');
+    demand(parent.status === 'active', 'dependency_unavailable', 'Version dependency is no longer active', {dependency});
+  }
+  return version;
 }
 export function decideRequest(index, input, actor, at) {
   fields(input, ['id', 'decision', 'reason'], ['id', 'decision', 'reason']);
@@ -98,8 +145,9 @@ export function expireRequests(index, at) {
 export function requestSummary(index, id) {
   const request = found(index.requests, key(id), 'Request');
   const grant = index.grants[request.grant];
-  return {
+  const summary = {
     id: request.id,
+    mode: request.mode ?? 'row',
     status: request.status,
     recipient: request.recipient,
     reference: request.reference,
@@ -112,4 +160,12 @@ export function requestSummary(index, id) {
     policyHash: request.policyHash,
     release: request.release ?? null,
   };
+  if (summary.mode === 'aggregate') {
+    summary.aggregate = request.aggregate;
+    summary.publishedCells = request.disclosure.publishedCells;
+    summary.suppressedCells = request.disclosure.suppressedCells;
+    summary.noRecordCells = request.disclosure.noRecordCells;
+    summary.zeroCells = request.disclosure.zeroCells;
+  }
+  return summary;
 }

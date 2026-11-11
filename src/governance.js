@@ -91,7 +91,9 @@ export function approvalWorklist(index, actor, at) {
       owner.enabled && owner.stewards.includes(actor) && actor !== request.requestedBy &&
       !request.approvals.some(approval => approval.actor === actor);
   }).map(request => ({id: request.id, reference: request.reference, recipient: request.recipient, purpose: request.purpose,
+    mode: request.mode ?? 'row',
     rows: request.outputRows, columns: request.columns, suppressed: request.disclosure.suppressedRows,
+    publishedCells: request.disclosure.publishedCells ?? null, suppressedCells: request.disclosure.suppressedCells ?? null,
     approvals: request.approvals.length, required: index.grants[request.grant].approvalCount,
     expiresAt: request.expiresAt, outputHash: request.outputHash}))
     .sort((a, b) => a.expiresAt.localeCompare(b.expiresAt) || a.id.localeCompare(b.id));

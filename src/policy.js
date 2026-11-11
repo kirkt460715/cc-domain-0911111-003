@@ -1,6 +1,7 @@
 import {fields, key, label, list, distinct, select, count, instant, demand, found, checksum, encode} from './primitives.js';
 import {CLASSIFICATIONS} from './schema.js';
 import {requireSteward, usableVersion} from './registry.js';
+import {aggregateSpec} from './aggregate.js';
 
 export function grantSpec(index, input, actor) {
   fields(input, ['id', 'dataset', 'recipient', 'purposes', 'regions', 'columns', 'maximumClassification',
@@ -96,6 +97,14 @@ export function assertGrant(index, grant, request, at) {
   demand(grant.purposes.includes(request.purpose), 'purpose', 'Purpose is outside grant');
   const version = usableVersion(index, request.reference);
   demand(version.dataset === grant.dataset, 'grant_dataset', 'Version is outside grant dataset');
+  if (request.mode === 'aggregate') {
+    assertAggregateGrant(version, grant, request);
+  } else {
+    assertRowGrant(version, grant, request);
+  }
+  return version;
+}
+function assertRowGrant(version, grant, request) {
   const columns = request.columns;
   demand(columns.length > 0 && columns.every(column => grant.columns.includes(column)), 'grant_columns', 'Requested columns exceed grant');
   demand(grant.quasiIdentifiers.every(column => columns.includes(column)), 'quasi_missing', 'Request omits required quasi identifier');
@@ -108,7 +117,27 @@ export function assertGrant(index, grant, request, at) {
       ['redact', 'tokenize'].includes(action.kind), 'classification', 'Pinned version classification exceeds grant');
     demand(column.classification !== 'restricted' || action.kind === 'redact', 'restricted', 'Restricted values cannot be released');
   }
-  return version;
+}
+function assertAggregateGrant(version, grant, request) {
+  demand(request.aggregate && typeof request.aggregate === 'object', 'aggregate_shape', 'Aggregate request requires an aggregate specification');
+  aggregateSpec(request.aggregate, version, grant);
+  const referenced = new Set([
+    ...request.aggregate.groupBy,
+    request.aggregate.subjectKey,
+    ...request.aggregate.measures.filter(measure => measure.source).map(measure => measure.source),
+    ...(request.filters ?? []).map(filter => filter.column),
+  ]);
+  for (const name of referenced) {
+    demand(grant.columns.includes(name), 'grant_columns', 'Aggregate references a column outside the grant', {column: name});
+    const column = version.schema.columns.find(item => item.name === name);
+    demand(column, 'version_column', 'Column is absent in pinned version');
+    const action = grant.transforms[name] ?? {kind: 'keep'};
+    demand(CLASSIFICATIONS.indexOf(column.classification) <= CLASSIFICATIONS.indexOf(grant.maximumClassification) ||
+      ['redact', 'tokenize', 'bucket', 'prefix', 'date_floor'].includes(action.kind),
+      'classification', 'Aggregate column exceeds clearance without protective transform', {column: name});
+    demand(column.classification !== 'restricted' || action.kind === 'redact',
+      'restricted', 'Restricted values cannot be used in aggregates', {column: name});
+  }
 }
 export function remainingBudget(index, grantId, exceptRequest = null) {
   const grant = found(index.grants, grantId, 'Grant');
@@ -129,5 +158,10 @@ export function remainingBudget(index, grantId, exceptRequest = null) {
 export function requireBudget(index, grantId, rows, exceptRequest = null) {
   const budget = remainingBudget(index, grantId, exceptRequest);
   demand(rows <= budget.availableRows && budget.availableReleases >= 1, 'budget', 'Grant budget is exhausted', budget, 409);
+  return budget;
+}
+export function requireAggregateBudget(index, grantId, exceptRequest = null) {
+  const budget = remainingBudget(index, grantId, exceptRequest);
+  demand(budget.availableReleases >= 1, 'budget', 'Grant release budget is exhausted', budget, 409);
   return budget;
 }
